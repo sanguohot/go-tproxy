@@ -7,8 +7,8 @@ import (
 	"net"
 	"os"
 	"strconv"
-	"strings"
 	"syscall"
+	"time"
 )
 
 // Listener describes a TCP Listener
@@ -68,6 +68,12 @@ func ListenTCP(network string, laddr *net.TCPAddr) (net.Listener, error) {
 	}
 	defer fileDescriptorSource.Close()
 
+	// 增加SO_MARK：255
+	// 配合iptables避免出现本程序发出的请求也被环回处理：iptables -t mangle -A OUTPUT -j RETURN -m mark --mark 0xff
+	//if err := syscall.SetsockoptInt(int(fileDescriptorSource.Fd()), syscall.SOL_SOCKET, syscall.SO_MARK, 255); err != nil {
+	//	return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("set socket option: SO_MARK: %s", err)}
+	//}
+
 	if err = syscall.SetsockoptInt(int(fileDescriptorSource.Fd()), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err != nil {
 		return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("set socket option: IP_TRANSPARENT: %s", err)}
 	}
@@ -109,6 +115,7 @@ func (conn *Conn) DialOriginalDestination(dontAssumeRemote bool) (*net.TCPConn, 
 	}
 
 	fileDescriptor, err := syscall.Socket(tcpAddrFamily("tcp", conn.LocalAddr().(*net.TCPAddr), conn.RemoteAddr().(*net.TCPAddr)), syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
+	//fileDescriptor, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
 	if err != nil {
 		return nil, &net.OpError{Op: "dial", Err: fmt.Errorf("socket open: %s", err)}
 	}
@@ -116,6 +123,14 @@ func (conn *Conn) DialOriginalDestination(dontAssumeRemote bool) (*net.TCPConn, 
 	if err = syscall.SetsockoptInt(fileDescriptor, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
 		syscall.Close(fileDescriptor)
 		return nil, &net.OpError{Op: "dial", Err: fmt.Errorf("set socket option: SO_REUSEADDR: %s", err)}
+	}
+
+	// 增加SO_MARK：255
+	// 配合iptables避免出现本程序发出的请求也被环回处理：iptables -t mangle -A OUTPUT -j RETURN -m mark --mark 0xff
+	if err := syscall.SetsockoptInt(fileDescriptor, syscall.SOL_SOCKET, syscall.SO_MARK, 255); err != nil {
+		//return nil, &net.OpError{Op: "listen", Net: network, Source: nil, Addr: laddr, Err: fmt.Errorf("set socket option: SO_MARK: %s", err)}
+		syscall.Close(fileDescriptor)
+		return nil, &net.OpError{Op: "dial", Err: fmt.Errorf("set socket option: SO_MARK: %s", err)}
 	}
 
 	if err = syscall.SetsockoptInt(fileDescriptor, syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err != nil {
@@ -135,7 +150,11 @@ func (conn *Conn) DialOriginalDestination(dontAssumeRemote bool) (*net.TCPConn, 
 		}
 	}
 
-	if err = syscall.Connect(fileDescriptor, remoteSocketAddress); err != nil && !strings.Contains(err.Error(), "operation now in progress") {
+	//if err = syscall.Connect(fileDescriptor, remoteSocketAddress); err != nil && !strings.Contains(err.Error(), "operation now in progress") {
+	//	syscall.Close(fileDescriptor)
+	//	return nil, &net.OpError{Op: "dial", Err: fmt.Errorf("socket connect: %s", err)}
+	//}
+	if err = connect(fileDescriptor, remoteSocketAddress, time.Time{}); err != nil {
 		syscall.Close(fileDescriptor)
 		return nil, &net.OpError{Op: "dial", Err: fmt.Errorf("socket connect: %s", err)}
 	}
@@ -150,6 +169,77 @@ func (conn *Conn) DialOriginalDestination(dontAssumeRemote bool) (*net.TCPConn, 
 	}
 
 	return remoteConn.(*net.TCPConn), nil
+}
+
+type timeoutError struct{}
+
+func (e *timeoutError) Error() string   { return "i/o timeout" }
+func (e *timeoutError) Timeout() bool   { return true }
+func (e *timeoutError) Temporary() bool { return true }
+
+var errTimeout = &timeoutError{}
+
+func FD_SET(fd uintptr, p *syscall.FdSet) {
+	n, k := fd/32, fd%32
+	p.Bits[n] |= (1 << uint32(k))
+}
+
+// this is close to the connect() function inside stdlib/net
+func connect(fd int, ra syscall.Sockaddr, deadline time.Time) error {
+	switch err := syscall.Connect(fd, ra); err {
+	case syscall.EINPROGRESS, syscall.EALREADY, syscall.EINTR:
+	case nil, syscall.EISCONN:
+		if !deadline.IsZero() && deadline.Before(time.Now()) {
+			return errTimeout
+		}
+		return nil
+	default:
+		return err
+	}
+
+	var err error
+	var to syscall.Timeval
+	var toptr *syscall.Timeval
+	var pw syscall.FdSet
+	FD_SET(uintptr(fd), &pw)
+	for {
+		// wait until the fd is ready to read or write.
+		if !deadline.IsZero() {
+			to = syscall.NsecToTimeval(deadline.Sub(time.Now()).Nanoseconds())
+			toptr = &to
+		}
+
+		// wait until the fd is ready to write. we can't use:
+		//   if err := fd.pd.WaitWrite(); err != nil {
+		//   	 return err
+		//   }
+		// so we use select instead.
+		if _, err = Select(fd+1, nil, &pw, nil, toptr); err != nil {
+			fmt.Println(err)
+			return err
+		}
+
+		var nerr int
+		nerr, err = syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_ERROR)
+		if err != nil {
+			return err
+		}
+		switch err = syscall.Errno(nerr); err {
+		case syscall.EINPROGRESS, syscall.EALREADY, syscall.EINTR:
+			continue
+		case syscall.Errno(0), syscall.EISCONN:
+			if !deadline.IsZero() && deadline.Before(time.Now()) {
+				return errTimeout
+			}
+			return nil
+		default:
+			return err
+		}
+	}
+}
+
+func Select(nfd int, r *syscall.FdSet, w *syscall.FdSet, e *syscall.FdSet, timeout *syscall.Timeval) (n int, err error) {
+	return syscall.Select(nfd, r, w, e, timeout)
 }
 
 // tcpAddToSockerAddr will convert a TCPAddr

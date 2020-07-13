@@ -51,10 +51,11 @@ func main() {
 	go listenUDP()
 
 	interruptListener := make(chan os.Signal)
-	signal.Notify(interruptListener, os.Interrupt)
+	signal.Notify(interruptListener, os.Interrupt, os.Kill)
 	<-interruptListener
 
 	log.Println("TProxy listener closing")
+	os.Exit(0)
 }
 
 // listenUDP runs in a routine to
@@ -159,12 +160,12 @@ func handleUDPConn(data []byte, srcAddr, dstAddr *net.UDPAddr) {
 func handleTCPConn(conn net.Conn) {
 	log.Printf("Accepting TCP connection from %s with destination of %s", conn.RemoteAddr().String(), conn.LocalAddr().String())
 	defer conn.Close()
-	
-	remoteConn, err := conn.(*tproxy.Conn).DialOriginalDestination(false)
+
+	remoteConn, err := conn.(*tproxy.Conn).DialOriginalDestination(true)
 	if err != nil {
 		log.Printf("Failed to connect to original destination [%s]: %s", conn.LocalAddr().String(), err)
 		return
-	} 
+	}
 	defer remoteConn.Close()
 
 	var streamWait sync.WaitGroup

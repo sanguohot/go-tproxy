@@ -1,0 +1,38 @@
+# 方案一
+# 测试，启动centos docker，进入docker，执行以下脚本，然后启动tproxy，执行curl www.baidu.com，即看到效果
+ip rule del fwmark 1 table 100
+ip route flush table 100
+iptables -t mangle -F
+iptables -t mangle -X SGHPROXY
+iptables -t mangle -X SGHPROXY_LOCAL
+
+iptables -t mangle -N SGHPROXY
+iptables -t mangle -N SGHPROXY_LOCAL
+ip rule add fwmark 1 table 100
+ip route add local 0.0.0.0/0 dev lo table 100
+
+iptables -t mangle -A SGHPROXY -d 255.255.255.255/32 -j RETURN
+iptables -t mangle -A SGHPROXY -d 0.0.0.0/8 -j RETURN
+iptables -t mangle -A SGHPROXY -d 10.0.0.0/8 -j RETURN
+iptables -t mangle -A SGHPROXY -d 127.0.0.0/8 -j RETURN
+iptables -t mangle -A SGHPROXY -d 169.254.0.0/16 -j RETURN
+iptables -t mangle -A SGHPROXY -d 172.16.0.0/12 -j RETURN
+iptables -t mangle -A SGHPROXY -d 192.168.0.0/16 -j RETURN
+iptables -t mangle -A SGHPROXY -d 224.0.0.0/4 -j RETURN
+iptables -t mangle -A SGHPROXY -d 240.0.0.0/4 -j RETURN
+iptables -t mangle -A SGHPROXY -p tcp -j TPROXY --on-port 8080 --on-ip 0.0.0.0 --tproxy-mark 1
+
+iptables -t mangle -A SGHPROXY_LOCAL -d 255.255.255.255/32 -j RETURN
+iptables -t mangle -A SGHPROXY_LOCAL -d 0.0.0.0/8 -j RETURN
+iptables -t mangle -A SGHPROXY_LOCAL -d 10.0.0.0/8 -j RETURN
+iptables -t mangle -A SGHPROXY_LOCAL -d 127.0.0.0/8 -j RETURN
+iptables -t mangle -A SGHPROXY_LOCAL -d 169.254.0.0/16 -j RETURN
+iptables -t mangle -A SGHPROXY_LOCAL -d 172.16.0.0/12 -j RETURN
+iptables -t mangle -A SGHPROXY_LOCAL -d 192.168.0.0/16 -j RETURN
+iptables -t mangle -A SGHPROXY_LOCAL -d 224.0.0.0/4 -j RETURN
+iptables -t mangle -A SGHPROXY_LOCAL -d 240.0.0.0/4 -j RETURN
+iptables -t mangle -A SGHPROXY_LOCAL -j RETURN -m mark --mark 0xff
+iptables -t mangle -A SGHPROXY_LOCAL -p tcp -j MARK --set-mark 1
+
+iptables -t mangle -A PREROUTING -j SGHPROXY
+iptables -t mangle -A OUTPUT -j SGHPROXY_LOCAL
